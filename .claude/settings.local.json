@@ -4,7 +4,11 @@
       "WebFetch(domain:www.withroam.com)",
       "Bash(python3 -c \"import requests, bs4, pandas, streamlit\")",
       "Bash(pip3 install:*)",
-      "Bash(python scraper/withroam_scraper.py 30327)"
+      "Bash(python scraper/withroam_scraper.py 30327)",
+      "Bash(python3 scraper/withroam_scraper.py 30327)",
+      "Skill(telegram:access)",
+      "Skill(telegram:access:*)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

@@ -46,7 +46,15 @@ def parse_price(text: str) -> float | None:
 
 
 def scrape_listing_page(url: str) -> dict | None:
-    """Scrape a single property listing page for detailed data."""
+    """Scrape a single property listing page for detailed data.
+
+    The page renders data as consecutive lines:
+      Label line
+      Value line
+    e.g. "Property tax" / "$134", "Down payment" / "$42,557"
+
+    We parse by splitting into clean lines and looking up known labels.
+    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -55,76 +63,156 @@ def scrape_listing_page(url: str) -> dict | None:
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-
     data = {"url": url}
 
-    # --- Try JSON-LD structured data first ---
+    # --- JSON-LD: grab address and price ---
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             obj = json.loads(script.string or "")
             if isinstance(obj, list):
                 obj = obj[0]
             if obj.get("@type") in ("SingleFamilyResidence", "House", "Residence", "RealEstateListing"):
-                data["address"] = obj.get("address", {}).get("streetAddress", "")
-                data["city"] = obj.get("address", {}).get("addressLocality", "")
-                data["state"] = obj.get("address", {}).get("addressRegion", "")
-                data["zip"] = obj.get("address", {}).get("postalCode", "")
-                data["price"] = parse_price(str(obj.get("price", "") or obj.get("offers", {}).get("price", "")))
+                addr = obj.get("address", {})
+                data.setdefault("address", addr.get("streetAddress", ""))
+                data.setdefault("city", addr.get("addressLocality", ""))
+                data.setdefault("state", addr.get("addressRegion", ""))
+                data.setdefault("zip", addr.get("postalCode", ""))
+                price_raw = obj.get("price") or obj.get("offers", {}).get("price")
+                if price_raw:
+                    data.setdefault("price", parse_price(str(price_raw)))
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    # --- Parse key mortgage/price fields from page HTML ---
-    text = soup.get_text(separator=" ", strip=True)
+    # --- Line-by-line parsing (matches actual page structure) ---
+    # Page renders: Label on one line, value on the next line.
+    lines = [l.strip() for l in soup.get_text(separator="\n").split("\n") if l.strip()]
 
-    def extract_after(label: str, source: str) -> str | None:
-        """Extract dollar value that appears after a label."""
-        pattern = rf"{re.escape(label)}\s*\$?([\d,]+(?:\.\d+)?)"
-        m = re.search(pattern, source, re.IGNORECASE)
-        return m.group(1).replace(",", "") if m else None
+    def next_dollar(label_idx: int) -> float | None:
+        """Return the dollar value on the line immediately after label_idx."""
+        for offset in range(1, 4):
+            if label_idx + offset >= len(lines):
+                break
+            candidate = lines[label_idx + offset]
+            m = re.match(r"^\$?([\d,]+(?:\.\d+)?)$", candidate.replace(",", ""))
+            if m:
+                return float(m.group(1).replace(",", ""))
+            # "$484" style (with dollar sign)
+            m2 = re.match(r"^\$([\d,]+(?:\.\d+)?)", candidate)
+            if m2:
+                return float(m2.group(1).replace(",", ""))
+        return None
 
-    def extract_pct_after(label: str, source: str) -> str | None:
-        pattern = rf"{re.escape(label)}\s*([\d.]+)\s*%"
-        m = re.search(pattern, source, re.IGNORECASE)
-        return m.group(1) if m else None
+    def find_line(label: str) -> int | None:
+        """Return index of first line matching label (case-insensitive)."""
+        for i, line in enumerate(lines):
+            if line.lower() == label.lower():
+                return i
+        return None
 
-    # Price / list price
+    # Price (first big dollar sign near top)
     if not data.get("price"):
-        price_tag = soup.find(string=re.compile(r"\$[\d,]+", re.I))
-        if price_tag:
-            data["price"] = parse_price(str(price_tag))
+        for line in lines[:10]:
+            m = re.match(r"^\$([\d,]+)$", line)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if val > 10000:
+                    data["price"] = val
+                    break
 
-    # Loan balance
-    for label in ["Loan Balance", "Remaining Balance", "Mortgage Balance", "Loan balance"]:
-        val = extract_after(label, text)
-        if val:
-            data["loan_balance"] = float(val)
+    # "Your payment" block: "$1,122/mo at 4.46%"
+    for i, line in enumerate(lines):
+        m = re.match(r"^\$([\d,]+)/mo at ([\d.]+)%$", line)
+        if m and i < 60:  # near top of page
+            data.setdefault("monthly_payment_total", float(m.group(1).replace(",", "")))
+            data.setdefault("assumable_rate_pct", float(m.group(2)))
             break
 
-    # Assumable rate
-    for label in ["Assumable Rate", "Interest Rate", "Loan Rate", "Rate"]:
-        val = extract_pct_after(label, text)
-        if val:
-            data["assumable_rate_pct"] = float(val)
+    # "VA loan:" / "FHA loan:" line: "$81,342 at 4.46%"
+    for i, line in enumerate(lines):
+        loan_m = re.match(r"^(VA|FHA|USDA|Conventional)\s+loan:$", line, re.I)
+        if loan_m:
+            data.setdefault("loan_type", loan_m.group(1).upper())
+            # Next line should be "$81,342 at 4.46%"
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                bal_m = re.match(r"^\$([\d,]+)\s+at\s+([\d.]+)%$", next_line)
+                if bal_m:
+                    data.setdefault("loan_balance", float(bal_m.group(1).replace(",", "")))
+                    data.setdefault("assumable_rate_pct", float(bal_m.group(2)))
             break
 
-    # Monthly payment
-    for label in ["Monthly Payment", "Mo. Payment", "Payment/mo", "monthly payment"]:
-        val = extract_after(label, text)
-        if val:
-            data["monthly_payment"] = float(val)
-            break
+    # Payment details block (after line "Payment details")
+    pd_idx = find_line("Payment details")
+    if pd_idx is not None:
+        # Principal/interest → next dollar value
+        pi_idx = find_line("Principal/interest")
+        if pi_idx and pi_idx > pd_idx:
+            val = next_dollar(pi_idx)
+            if val:
+                data["monthly_payment"] = val  # P&I only
 
-    # Down payment / equity needed
-    for label in ["Down Payment", "Equity Needed", "Down payment", "down payment"]:
-        val = extract_after(label, text)
-        if val:
-            data["equity_needed"] = float(val)
-            break
+        # Home price
+        hp_idx = find_line("Home price")
+        if hp_idx and hp_idx > pd_idx:
+            val = next_dollar(hp_idx)
+            if val and val > 10000:
+                data.setdefault("price", val)
 
-    # Beds / baths / sqft
-    beds_m = re.search(r"(\d+)\s*(?:bed|BR|bedroom)", text, re.I)
-    baths_m = re.search(r"(\d+(?:\.\d)?)\s*(?:bath|BA|bathroom)", text, re.I)
-    sqft_m = re.search(r"([\d,]+)\s*(?:sq\.?\s*ft|sqft|square feet)", text, re.I)
+        # Down payment (= equity needed)
+        dp_idx = find_line("Down payment")
+        if dp_idx and dp_idx > pd_idx:
+            val = next_dollar(dp_idx)
+            if val:
+                data["equity_needed"] = val
+
+        # Total loan balance
+        tl_idx = find_line("Total loan")
+        if tl_idx and tl_idx > pd_idx:
+            val = next_dollar(tl_idx)
+            if val:
+                data.setdefault("loan_balance", val)
+            # Rate is in parens on the same line or next: "(4.46%)"
+            tl_line = lines[tl_idx]
+            rate_m = re.search(r"\(([\d.]+)%\)", tl_line)
+            if not rate_m and tl_idx + 1 < len(lines):
+                rate_m = re.search(r"\(([\d.]+)%\)", lines[tl_idx + 1])
+            if rate_m:
+                data.setdefault("assumable_rate_pct", float(rate_m.group(1)))
+
+        # Term
+        term_idx = find_line("Term")
+        if term_idx and term_idx > pd_idx:
+            if term_idx + 1 < len(lines):
+                term_m = re.match(r"^(\d+)\s*yrs?$", lines[term_idx + 1])
+                if term_m:
+                    data["remaining_years"] = int(term_m.group(1))
+
+        # Property tax (monthly)
+        tax_idx = find_line("Property tax")
+        if tax_idx and tax_idx > pd_idx:
+            val = next_dollar(tax_idx)
+            if val:
+                data["monthly_tax"] = val
+
+        # Home insurance
+        ins_idx = find_line("Home insurance")
+        if ins_idx and ins_idx > pd_idx:
+            val = next_dollar(ins_idx)
+            if val:
+                data["monthly_insurance"] = val
+
+        # HOA
+        hoa_idx = find_line("HOA")
+        if hoa_idx and hoa_idx > pd_idx:
+            val = next_dollar(hoa_idx)
+            if val is not None:
+                data["monthly_hoa"] = val
+
+    # Beds / baths / sqft (format: "1 bed", "2 bath", "414 sqft")
+    full_text = " ".join(lines)
+    beds_m = re.search(r"(\d+)\s+bed\b", full_text, re.I)
+    baths_m = re.search(r"(\d+(?:\.\d)?)\s+bath\b", full_text, re.I)
+    sqft_m = re.search(r"([\d,]+)\s+sqft\b", full_text, re.I)
 
     if beds_m:
         data["beds"] = int(beds_m.group(1))
@@ -133,36 +221,38 @@ def scrape_listing_page(url: str) -> dict | None:
     if sqft_m:
         data["sqft"] = int(sqft_m.group(1).replace(",", ""))
 
-    # Property tax (monthly)
-    for label in ["Property Tax", "Taxes", "Tax/mo"]:
-        val = extract_after(label, text)
-        if val:
-            data["monthly_tax"] = float(val) if float(val) < 5000 else float(val) / 12
-            break
+    # Loan type fallback from text
+    if "loan_type" not in data:
+        lt_m = re.search(r"\b(VA|FHA|USDA)\b", full_text)
+        if lt_m:
+            data["loan_type"] = lt_m.group(1).upper()
+        elif "conventional" in full_text.lower():
+            data["loan_type"] = "CONVENTIONAL"
 
-    # Insurance (monthly)
-    for label in ["Insurance", "Homeowners Insurance", "Insurance/mo"]:
-        val = extract_after(label, text)
-        if val:
-            data["monthly_insurance"] = float(val) if float(val) < 2000 else float(val) / 12
-            break
+    # Address fallback from page title
+    if not data.get("address"):
+        title = soup.find("title")
+        if title:
+            addr_m = re.search(r"Buy\s+(.+?)\s+with a", title.get_text())
+            if addr_m:
+                data["address"] = addr_m.group(1).strip()
 
-    # HOA (monthly)
-    for label in ["HOA", "HOA Fee", "HOA/mo"]:
-        val = extract_after(label, text)
-        if val:
-            data["monthly_hoa"] = float(val)
-            break
-
-    # Loan type
-    loan_type_m = re.search(r"\b(VA|FHA|Conventional|USDA)\b", text, re.I)
-    if loan_type_m:
-        data["loan_type"] = loan_type_m.group(1).upper()
-
-    # Remaining term
-    term_m = re.search(r"(\d+)\s*(?:years?|yr)\s*(?:remaining|left|term)", text, re.I)
-    if term_m:
-        data["remaining_years"] = int(term_m.group(1))
+    # Extract zip / city / state from address if missing
+    # Address format: "Street, City, GA, 30324"
+    addr_str = data.get("address", "")
+    if addr_str and not data.get("zip"):
+        zip_m = re.search(r"\b(\d{5})\b", addr_str)
+        if zip_m:
+            data["zip"] = zip_m.group(1)
+    if addr_str and not data.get("city"):
+        # e.g. "2106 Pine Heights Dr NE, Atlanta, GA, 30324" → Atlanta
+        city_m = re.search(r",\s*([^,]+),\s*[A-Z]{2}\b", addr_str)
+        if city_m:
+            data["city"] = city_m.group(1).strip()
+    if addr_str and not data.get("state"):
+        state_m = re.search(r",\s*([A-Z]{2})\s*[,\d]", addr_str)
+        if state_m:
+            data["state"] = state_m.group(1)
 
     return data
 
@@ -214,7 +304,9 @@ def scrape_search_results(zip_code: str) -> list[dict]:
             print(f"    Scraping: {link}")
             detail = scrape_listing_page(link)
             if detail:
-                detail.setdefault("zip", zip_code)
+                # Use search zip as fallback if scraper didn't find one
+                if not detail.get("zip"):
+                    detail["zip"] = zip_code
                 listings.append(detail)
             time.sleep(0.8)  # polite crawl delay
 
@@ -273,10 +365,14 @@ if __name__ == "__main__":
     df = scrape_atlanta(zip_codes=[test_zip])
 
     if not df.empty:
-        output = f"/Users/yingyunai/Desktop/Code/RealEstate/data/listings_test.csv"
+        output = "/Users/yingyunai/Desktop/Code/RealEstate/data/listings_test.csv"
         df.to_csv(output, index=False)
         print(f"\nSaved to {output}")
-        print(df[["address", "price", "loan_balance", "assumable_rate_pct",
-                   "monthly_payment", "equity_needed", "beds", "baths"]].to_string())
+        print(f"Columns found: {list(df.columns)}")
+        show_cols = [c for c in ["address", "price", "loan_balance", "assumable_rate_pct",
+                                  "monthly_payment", "equity_needed", "beds", "baths", "loan_type",
+                                  "monthly_tax", "monthly_insurance", "monthly_hoa", "remaining_years"]
+                     if c in df.columns]
+        print(df[show_cols].head(10).to_string())
     else:
         print("No data scraped.")
