@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.withroam.com)",
+      "Bash(python3 -c \"import requests, bs4, pandas, streamlit\")",
+      "Bash(pip3 install:*)",
+      "Bash(python scraper/withroam_scraper.py 30327)"
+    ]
+  }
+}
