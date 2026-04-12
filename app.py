@@ -470,17 +470,17 @@ def apply_filters(vacancy, maintenance, capex, use_pm, max_equity, min_cf,
         return pd.DataFrame(), {}
 
     assumptions = {
-        "vacancy_rate": (vacancy or 5) / 100,
-        "maintenance_pct": (maintenance or 1.0) / 100,
+        "vacancy_rate": (5 if vacancy is None else vacancy) / 100,
+        "maintenance_pct": (1.0 if maintenance is None else maintenance) / 100,
         "capex_monthly": 100 if capex is None else capex,
         "use_property_manager": bool(use_pm),
     }
     df = analyze_portfolio(RAW_DF, assumptions)
 
     if "equity_needed" in df.columns:
-        df = df[df["equity_needed"].fillna(999999) <= (max_equity or 999999)]
+        df = df[df["equity_needed"].fillna(999999) <= (999999 if max_equity is None else max_equity)]
     if "monthly_cashflow" in df.columns:
-        df = df[df["monthly_cashflow"].fillna(-9999) >= (min_cf or -9999)]
+        df = df[df["monthly_cashflow"].fillna(-9999) >= (-9999 if min_cf is None else min_cf)]
     if "loan_type" in df.columns and loan_types:
         df = df[df["loan_type"].str.upper().isin(loan_types) | df["loan_type"].isna()]
     if "beds" in df.columns and min_beds:
@@ -516,19 +516,20 @@ def update_table(vacancy, maintenance, capex, use_pm, max_equity, min_cf, loan_t
                               max_equity, min_cf, loan_types, min_beds)
 
     # Cards
-    total   = stats.get("total_listings", 0)
+    total   = len(RAW_DF)
+    filtered_total = stats.get("total_listings", 0)
     pos     = stats.get("cashflow_positive", 0)
     avg_cf  = stats.get("avg_monthly_cashflow")
     avg_eq  = stats.get("avg_equity_needed")
     avg_coc = stats.get("avg_coc_return")
 
     card_total   = str(total)
-    card_pos     = f"{pos}  ({pos/total*100:.0f}%)" if total else "0"
+    card_pos     = f"{pos}  ({pos/filtered_total*100:.0f}%)" if filtered_total else "0"
     card_avg_cf  = f"${avg_cf:+,}" if avg_cf is not None else "—"
     card_avg_eq  = f"${avg_eq:,.0f}" if avg_eq is not None else "—"
     card_avg_coc = f"{avg_coc:.1f}%" if avg_coc is not None else "—"
 
-    title = f"房源列表 / Listings（{len(df)} 套）"
+    title = f"房源列表 / Listings（筛选后 {len(df)} / 总计 {total}）"
 
     if df.empty:
         return card_total, card_pos, card_avg_cf, card_avg_eq, card_avg_coc, title, [], [], []
