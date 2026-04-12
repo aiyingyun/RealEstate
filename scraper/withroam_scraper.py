@@ -119,13 +119,19 @@ def scrape_listing_page(url: str) -> dict | None:
                     data["price"] = val
                     break
 
-    # "Your payment" block: "$1,122/mo at 4.46%"
-    for i, line in enumerate(lines):
-        m = re.match(r"^\$([\d,]+)/mo at ([\d.]+)%$", line)
-        if m and i < 60:  # near top of page
-            data.setdefault("monthly_payment_total", float(m.group(1).replace(",", "")))
-            data.setdefault("assumable_rate_pct", float(m.group(2)))
-            break
+    # "Your payment" block: find the "Your payment" label first, then grab the next "$X/mo at Y%" line.
+    # The page also shows "$X/mo at 6.4%" (market rate) ABOVE this section — we must NOT pick that up.
+    yp_idx = find_line("Your payment")
+    if yp_idx is not None:
+        for offset in range(1, 5):
+            if yp_idx + offset >= len(lines):
+                break
+            candidate = lines[yp_idx + offset]
+            m = re.match(r"^\$([\d,]+)/mo at ([\d.]+)%$", candidate)
+            if m:
+                data.setdefault("monthly_payment_total", float(m.group(1).replace(",", "")))
+                data.setdefault("assumable_rate_pct", float(m.group(2)))
+                break
 
     # "VA loan:" / "FHA loan:" line: "$81,342 at 4.46%"
     for i, line in enumerate(lines):
@@ -200,6 +206,15 @@ def scrape_listing_page(url: str) -> dict | None:
             val = next_dollar(ins_idx)
             if val:
                 data["monthly_insurance"] = val
+
+        # Loan / mortgage insurance
+        loan_ins_idx = find_line("Loan insurance")
+        if loan_ins_idx is None:
+            loan_ins_idx = find_line("Mortgage insurance")
+        if loan_ins_idx and loan_ins_idx > pd_idx:
+            val = next_dollar(loan_ins_idx)
+            if val is not None:
+                data["monthly_loan_insurance"] = val
 
         # HOA
         hoa_idx = find_line("HOA")
@@ -371,7 +386,8 @@ if __name__ == "__main__":
         print(f"Columns found: {list(df.columns)}")
         show_cols = [c for c in ["address", "price", "loan_balance", "assumable_rate_pct",
                                   "monthly_payment", "equity_needed", "beds", "baths", "loan_type",
-                                  "monthly_tax", "monthly_insurance", "monthly_hoa", "remaining_years"]
+                                  "monthly_tax", "monthly_insurance", "monthly_loan_insurance",
+                                  "monthly_hoa", "remaining_years"]
                      if c in df.columns]
         print(df[show_cols].head(10).to_string())
     else:

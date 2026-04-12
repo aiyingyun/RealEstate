@@ -3,8 +3,41 @@ Cash flow analysis model for assumable mortgage properties.
 Calculates monthly cash flow, cash-on-cash return, and investment metrics.
 """
 
+import math
 import pandas as pd
 import numpy as np
+
+
+def _safe_round(val, ndigits=0):
+    """Round val, returning None if NaN/None."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    return round(val, ndigits)
+
+
+def _estimate_remaining_years(principal: float, monthly_payment: float, annual_rate_pct: float) -> float | None:
+    """Estimate remaining amortization term from balance, payment, and rate."""
+    if principal <= 0 or monthly_payment <= 0 or annual_rate_pct < 0:
+        return None
+
+    monthly_rate = annual_rate_pct / 100 / 12
+    if monthly_rate == 0:
+        return principal / monthly_payment / 12 if monthly_payment > 0 else None
+
+    # Payment must be high enough to cover at least the current month's interest.
+    min_payment = principal * monthly_rate
+    if monthly_payment <= min_payment:
+        return None
+
+    try:
+        n_payments = -math.log(1 - (principal * monthly_rate / monthly_payment)) / math.log(1 + monthly_rate)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if not math.isfinite(n_payments) or n_payments <= 0:
+        return None
+
+    return n_payments / 12
 
 # Assumptions (can be overridden per analysis)
 DEFAULTS = {
@@ -35,6 +68,7 @@ def calculate_cashflow(row: dict, assumptions: dict = None) -> dict:
     monthly_payment = float(row.get("monthly_payment") or 0)
     monthly_tax = float(row.get("monthly_tax") or 0)
     monthly_insurance = float(row.get("monthly_insurance") or 0)
+    monthly_loan_insurance = float(row.get("monthly_loan_insurance") or 0)
     monthly_hoa = float(row.get("monthly_hoa") or 0)
     rent_estimate = float(row.get("rent_estimate") or 0)
     equity_needed = float(row.get("equity_needed") or (price - loan_balance) if price and loan_balance else 0)
@@ -65,7 +99,7 @@ def calculate_cashflow(row: dict, assumptions: dict = None) -> dict:
     # CapEx reserve
     capex = cfg["capex_monthly"]
 
-    total_expenses = pni + monthly_tax + monthly_insurance + monthly_hoa + maintenance + mgmt_fee + capex
+    total_expenses = pni + monthly_tax + monthly_insurance + monthly_loan_insurance + monthly_hoa + maintenance + mgmt_fee + capex
 
     # --- Cash Flow ---
     monthly_cashflow = effective_rent - total_expenses
@@ -85,39 +119,62 @@ def calculate_cashflow(row: dict, assumptions: dict = None) -> dict:
     # Break-even rent (min rent needed for positive cash flow)
     breakeven_rent = total_expenses / (1 - cfg["vacancy_rate"])
 
+    actual_remaining_years = row.get("remaining_years")
+    if actual_remaining_years is not None and not (isinstance(actual_remaining_years, float) and math.isnan(actual_remaining_years)):
+        actual_remaining_years = float(actual_remaining_years)
+    else:
+        actual_remaining_years = None
+
+    estimated_remaining_years = None
+    if actual_remaining_years is None:
+        estimated_remaining_years = _estimate_remaining_years(
+            principal=loan_balance,
+            monthly_payment=monthly_payment,
+            annual_rate_pct=float(row.get("assumable_rate_pct") or 0),
+        )
+
+    effective_remaining_years = actual_remaining_years or estimated_remaining_years
+
     # Rate comparison: new mortgage rate savings
     assumable_rate = float(row.get("assumable_rate_pct") or 0)
     new_rate = 7.0  # current 30yr fixed approximation
-    if assumable_rate > 0 and loan_balance > 0:
-        remaining_years = float(row.get("remaining_years") or 25)
-        new_payment = _mortgage_payment(loan_balance, new_rate / 100 / 12, remaining_years * 12)
+    if assumable_rate > 0 and loan_balance > 0 and effective_remaining_years:
+        new_payment = _mortgage_payment(loan_balance, new_rate / 100 / 12, int(round(effective_remaining_years * 12)))
         monthly_rate_savings = new_payment - monthly_payment
     else:
-        monthly_rate_savings = 0
+        monthly_rate_savings = None
 
     return {
         # Income
-        "gross_rent": round(gross_rent),
-        "vacancy_loss": round(vacancy_loss),
-        "effective_rent": round(effective_rent),
+        "gross_rent": _safe_round(gross_rent),
+        "vacancy_loss": _safe_round(vacancy_loss),
+        "effective_rent": _safe_round(effective_rent),
         # Expenses
-        "pni_payment": round(pni),
-        "monthly_tax": round(monthly_tax),
-        "monthly_insurance": round(monthly_insurance),
-        "monthly_hoa": round(monthly_hoa),
-        "maintenance": round(maintenance),
-        "mgmt_fee": round(mgmt_fee),
-        "capex": round(capex),
-        "total_expenses": round(total_expenses),
+        "pni_payment": _safe_round(pni),
+        "monthly_tax": _safe_round(monthly_tax),
+        "monthly_insurance": _safe_round(monthly_insurance),
+        "monthly_loan_insurance": _safe_round(monthly_loan_insurance),
+        "monthly_hoa": _safe_round(monthly_hoa),
+        "maintenance": _safe_round(maintenance),
+        "mgmt_fee": _safe_round(mgmt_fee),
+        "capex": _safe_round(capex),
+        "total_expenses": _safe_round(total_expenses),
         # Results
-        "monthly_cashflow": round(monthly_cashflow),
-        "annual_cashflow": round(annual_cashflow),
-        "cash_on_cash_pct": round(cash_on_cash, 2) if cash_on_cash is not None else None,
-        "cap_rate_pct": round(cap_rate, 2) if cap_rate is not None else None,
-        "grm": round(grm, 1) if grm is not None else None,
-        "breakeven_rent": round(breakeven_rent),
-        "equity_needed": round(equity_needed),
-        "monthly_rate_savings": round(monthly_rate_savings),
+        "monthly_cashflow": _safe_round(monthly_cashflow),
+        "annual_cashflow": _safe_round(annual_cashflow),
+        "cash_on_cash_pct": _safe_round(cash_on_cash, 2),
+        "cap_rate_pct": _safe_round(cap_rate, 2),
+        "grm": _safe_round(grm, 1),
+        "breakeven_rent": _safe_round(breakeven_rent),
+        "equity_needed": _safe_round(equity_needed),
+        "effective_remaining_years": _safe_round(effective_remaining_years, 2),
+        "estimated_remaining_years": _safe_round(estimated_remaining_years, 2),
+        "remaining_years_source": (
+            "actual" if actual_remaining_years is not None else
+            "estimated_from_balance_payment_rate" if estimated_remaining_years is not None else
+            None
+        ),
+        "monthly_rate_savings": _safe_round(monthly_rate_savings),
         "cashflow_positive": monthly_cashflow > 0,
     }
 
@@ -140,6 +197,9 @@ def analyze_portfolio(df: pd.DataFrame, assumptions: dict = None) -> pd.DataFram
         results.append(cf)
 
     cf_df = pd.DataFrame(results)
+    # Drop columns from cf_df that already exist in df to avoid duplicates
+    overlap = [c for c in cf_df.columns if c in df.columns]
+    cf_df = cf_df.drop(columns=overlap)
     return pd.concat([df.reset_index(drop=True), cf_df], axis=1)
 
 
@@ -161,6 +221,6 @@ def summary_stats(df: pd.DataFrame) -> dict:
         "median_monthly_cashflow": round(valid[cf_col].median()),
         "best_cashflow": round(valid[cf_col].max()),
         "worst_cashflow": round(valid[cf_col].min()),
-        "avg_equity_needed": round(valid["equity_needed"].mean()) if "equity_needed" in valid else None,
-        "avg_coc_return": round(valid["cash_on_cash_pct"].mean(), 2) if "cash_on_cash_pct" in valid else None,
+        "avg_equity_needed": round(valid["equity_needed"].mean()) if "equity_needed" in valid.columns else None,
+        "avg_coc_return": round(valid["cash_on_cash_pct"].mean(), 2) if "cash_on_cash_pct" in valid.columns else None,
     }

@@ -8,7 +8,23 @@
       "Bash(python3 scraper/withroam_scraper.py 30327)",
       "Skill(telegram:access)",
       "Skill(telegram:access:*)",
-      "Bash(python3 -c ':*)"
+      "Bash(python3 -c ':*)",
+      "Bash(.venv/bin/python:*)",
+      "WebFetch(domain:www.realtyapi.io)",
+      "WebFetch(domain:docs.realtyapi.io)",
+      "WebFetch(domain:api.realtyapi.io)",
+      "WebFetch(domain:realtyapi.io)",
+      "WebSearch",
+      "WebFetch(domain:developers.realtyapi.io)",
+      "WebFetch(domain:dev.to)",
+      "Bash(curl -s 'https://zillow.realtyapi.io/property/address?address=615+Broadview+Pl+NE+Atlanta+GA+30324' -H 'x-realtyapi-key: rt_3Ckx49mg9usP0RGZFfSn8k8r')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s https://api.realtyapi.io/ -H 'x-realtyapi-key: rt_3Ckx49mg9usP0RGZFfSn8k8r')",
+      "Bash(curl -s \"https://zillow.realtyapi.io/property\")",
+      "Bash(curl -s \"https://realtyapi.io/docs/zillow/property-details\")",
+      "Bash(curl -s \"https://realtyapi.io/docs/zillow/rent-estimate\")",
+      "Bash(curl -s 'https://zillow.realtyapi.io/pro/byaddress?propertyaddress=615+Broadview+Pl+NE,+Atlanta,+GA+30324' -H 'x-realtyapi-key: rt_3Ckx49mg9usP0RGZFfSn8k8r')",
+      "Bash(python:*)"
     ]
   }
 }
