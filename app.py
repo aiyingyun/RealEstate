@@ -89,6 +89,24 @@ def normalize_raw_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
         raw_df["rent_source"] = None
     has_realtyapi_rent = current_rent.notna()
     raw_df.loc[has_realtyapi_rent, "rent_source"] = "realtyapi_graph_current_rent_zestimate"
+
+    if "property_type" not in raw_df.columns:
+        address_text = raw_df.get("address", pd.Series("", index=raw_df.index)).fillna("").astype(str).str.lower()
+        street_text = raw_df.get("PropertyAddress_streetAddress", pd.Series("", index=raw_df.index)).fillna("").astype(str).str.lower()
+        subdivision_text = raw_df.get("PropertyAddress_subdivision", pd.Series("", index=raw_df.index)).fillna("").astype(str).str.lower()
+        combined_text = (address_text + " " + street_text + " " + subdivision_text).str.strip()
+
+        townhouse_mask = combined_text.str.contains(r"townh|townhome|townhouse|twnhms|rowhouse", regex=True)
+        condo_mask = combined_text.str.contains(r"\bapt\b|\bunit\b|\bcondo\b|condominium|loft|highrise|midtown|#\s*\w+", regex=True)
+
+        raw_df["property_type"] = "House"
+        raw_df.loc[condo_mask, "property_type"] = "Condo/Apartment"
+        raw_df.loc[townhouse_mask, "property_type"] = "Townhouse"
+
+    equity = pd.to_numeric(raw_df.get("equity_needed"), errors="coerce")
+    loan_balance = pd.to_numeric(raw_df.get("loan_balance"), errors="coerce")
+    raw_df["equity_loan_balance_ratio"] = (equity / loan_balance) * 100
+    raw_df.loc[(loan_balance <= 0) | loan_balance.isna(), "equity_loan_balance_ratio"] = pd.NA
     return raw_df
 
 
@@ -99,6 +117,7 @@ RAW_DF = normalize_raw_columns(enrich_raw_with_history_summary(load_raw(), HISTO
 # ── Column display config ──────────────────────────────────────────────────────
 COL_RENAME = {
     "address":                    "地址 / Address",
+    "property_type":              "房产类型 / Property Type",
     "zip":                        "邮编 / Zip",
     "beds":                       "卧室 / Beds",
     "baths":                      "浴室 / Baths",
@@ -109,6 +128,7 @@ COL_RENAME = {
     "DataPoints_Current_Rent_Zestimate": "当前租金估值 / Current Rent Zestimate",
     "daysOnZillow":               "上市天数 / Days Listed",
     "loan_balance":               "贷款余额 / Loan Balance",
+    "equity_loan_balance_ratio":  "首付/贷款比 / Equity-Loan Ratio",
     "assumable_rate_pct":         "可承接利率 / Rate%",
     "loan_type":                  "贷款类型 / Type",
     "remaining_years":            "剩余年限 / Yrs",
@@ -132,8 +152,36 @@ DISPLAY_ORDER = list(COL_RENAME.keys())
 DOLLAR_COLS = {"price", "zestimate", "DataPoints_Current_Rent_Zestimate", "loan_balance", "equity_needed", "monthly_payment",
                "gross_rent", "monthly_cashflow", "annual_cashflow",
                "breakeven_rent", "monthly_rate_savings"}
-PCT_COLS    = {"assumable_rate_pct", "cash_on_cash_pct", "cap_rate_pct"}
+PCT_COLS    = {"assumable_rate_pct", "cash_on_cash_pct", "cap_rate_pct", "equity_loan_balance_ratio"}
 LINK_COLS = {"url", "zillow_link"}
+
+
+def get_available_loan_types() -> list[str]:
+    """Return loan types actually present in the current dataset."""
+    if RAW_DF.empty or "loan_type" not in RAW_DF.columns:
+        return []
+    vals = (
+        RAW_DF["loan_type"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    return sorted(v for v in vals.unique().tolist() if v)
+
+
+AVAILABLE_LOAN_TYPES = get_available_loan_types()
+
+
+def get_available_property_types() -> list[str]:
+    """Return inferred property types actually present in the current dataset."""
+    if RAW_DF.empty or "property_type" not in RAW_DF.columns:
+        return []
+    vals = RAW_DF["property_type"].dropna().astype(str).str.strip()
+    return sorted(v for v in vals.unique().tolist() if v)
+
+
+AVAILABLE_PROPERTY_TYPES = get_available_property_types()
 
 
 def build_table_columns(cols_present: list[str]) -> list[dict]:
@@ -312,71 +360,103 @@ app = dash.Dash(
     title="Atlanta 可承接房贷 / Assumable Mortgage",
 )
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-sidebar = html.Div([
-    dbc.Card([
-        dbc.CardHeader(html.B("分析参数 / Assumptions")),
-        dbc.CardBody([
-            html.Label("空置率 / Vacancy Rate", className="fw-semibold mt-1"),
-            dcc.Slider(id="vacancy", min=0, max=20, step=1, value=5,
-                       marks={0:"0%", 5:"5%", 10:"10%", 20:"20%"},
-                       tooltip={"placement":"bottom","always_visible":True},
-                       className="mb-3"),
+PAGE_BG = "#f5f7fb"
+PANEL_BG = "#ffffff"
+SOFT_BORDER = "1px solid #e3e8ef"
+SHADOW = "0 10px 30px rgba(31, 41, 55, 0.08)"
+HEADER_GRADIENT = "linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #38bdf8 100%)"
+
+
+def section_card(title: str, children, class_name: str = ""):
+    return dbc.Card(
+        [
+            dbc.CardHeader(html.B(title), style={"backgroundColor": "#f8fafc", "borderBottom": SOFT_BORDER}),
+            dbc.CardBody(children),
+        ],
+        className=class_name,
+        style={"border": SOFT_BORDER, "borderRadius": "18px", "boxShadow": SHADOW, "backgroundColor": PANEL_BG},
+    )
+
+# ── Controls ───────────────────────────────────────────────────────────────────
+top_controls = dbc.Row([
+    dbc.Col(section_card("分析参数 / Assumptions", [
+        html.Label("空置率 / Vacancy Rate", className="fw-semibold mt-1"),
+        dcc.Slider(id="vacancy", min=0, max=20, step=1, value=5,
+                   marks={0:"0%", 5:"5%", 10:"10%", 20:"20%"},
+                   tooltip={"placement":"bottom","always_visible":True},
+                   className="mb-3"),
 
         html.Label("维护预算 / Maintenance Reserve (%/yr)", className="fw-semibold"),
-            dcc.Slider(id="maintenance", min=0.5, max=2.0, step=0.1, value=1.0,
-                       marks={0.5:"0.5%", 1.0:"1%", 2.0:"2%"},
-                       tooltip={"placement":"bottom","always_visible":True},
-                       className="mb-3"),
+        dcc.Slider(id="maintenance", min=0.5, max=2.0, step=0.1, value=1.0,
+                   marks={0.5:"0.5%", 1.0:"1%", 2.0:"2%"},
+                   tooltip={"placement":"bottom","always_visible":True},
+                   className="mb-3"),
 
-            html.Label("资本支出储备 / CapEx ($/mo)", className="fw-semibold"),
-            dbc.Input(id="capex", type="number", value=100, min=0, max=500, step=25,
-                      className="mb-3"),
+        dbc.Row([
+            dbc.Col([
+                html.Label("资本支出储备 / CapEx ($/mo)", className="fw-semibold"),
+                dbc.Input(id="capex", type="number", value=100, min=0, max=500, step=25, className="mb-0"),
+            ], md=6),
+            dbc.Col([
+                html.Label("当前市场利率 / Current 30yr Rate (%)", className="fw-semibold"),
+                dbc.Input(id="current-rate", type="number", value=7.0, min=5.0, max=10.0, step=0.1, className="mb-0"),
+            ], md=6),
+        ], className="g-3 mb-3"),
 
-            dbc.Checklist(id="use-pm",
-                          options=[{"label": "使用物业管理 (8%) / Use Property Manager (8%)",
-                                    "value": "yes"}],
-                          value=[], className="mb-3"),
-
-            html.Label("当前市场利率 / Current 30yr Rate (%)", className="fw-semibold"),
-            dbc.Input(id="current-rate", type="number", value=7.0, min=5.0, max=10.0, step=0.1,
-                      className="mb-0"),
-        ]),
-    ], className="shadow-sm mb-3"),
-
-    dbc.Card([
-        dbc.CardHeader(html.B("筛选条件 / Filters")),
-        dbc.CardBody([
-            html.Label("最大首付 / Max Equity Needed ($)", className="fw-semibold mt-1"),
-            dbc.Input(id="max-equity", type="number", value=200000, min=0, max=500000, step=10000,
-                      className="mb-3"),
-
-            html.Label("最低月现金流 / Min Monthly CF ($)", className="fw-semibold"),
-            dbc.Input(id="min-cf", type="number", value=-500, min=-2000, max=5000, step=100,
-                      className="mb-3"),
-
-            html.Label("贷款类型 / Loan Types", className="fw-semibold"),
-            dcc.Dropdown(id="loan-types",
-                         options=[{"label": t, "value": t} for t in ["VA","FHA","CONVENTIONAL","USDA"]],
-                         value=["VA","FHA","CONVENTIONAL","USDA"],
-                         multi=True, className="mb-3"),
-
-            html.Label("最少卧室数 / Min Bedrooms", className="fw-semibold"),
-            dcc.Dropdown(id="min-beds",
-                         options=[{"label": str(n), "value": n} for n in [1,2,3,4]],
-                         value=1, clearable=False, className="mb-0"),
-        ]),
-    ], className="shadow-sm"),
-], className="h-100")
+        dbc.Checklist(id="use-pm",
+                      options=[{"label": "使用物业管理 (8%) / Use Property Manager (8%)",
+                                "value": "yes"}],
+                      value=[], className="mb-0"),
+    ]), md=5),
+    dbc.Col(section_card("筛选条件 / Filters", [
+        dbc.Row([
+            dbc.Col([
+                html.Label("最大首付 / Max Equity Needed ($)", className="fw-semibold mt-1"),
+                dbc.Input(id="max-equity", type="number", value=200000, min=0, max=500000, step=10000, className="mb-3"),
+            ], md=6),
+            dbc.Col([
+                html.Label("最低月现金流 / Min Monthly CF ($)", className="fw-semibold mt-1"),
+                dbc.Input(id="min-cf", type="number", value=-500, min=-2000, max=5000, step=100, className="mb-3"),
+            ], md=6),
+        ], className="g-3"),
+        dbc.Row([
+            dbc.Col([
+                html.Label("贷款类型 / Loan Types", className="fw-semibold"),
+                dcc.Dropdown(id="loan-types",
+                             options=[{"label": t, "value": t} for t in AVAILABLE_LOAN_TYPES],
+                             value=AVAILABLE_LOAN_TYPES,
+                             multi=True, className="mb-0"),
+            ], md=4),
+            dbc.Col([
+                html.Label("房产类型 / Property Types", className="fw-semibold"),
+                dcc.Dropdown(id="property-types",
+                             options=[{"label": t, "value": t} for t in AVAILABLE_PROPERTY_TYPES],
+                             value=AVAILABLE_PROPERTY_TYPES,
+                             multi=True, className="mb-0"),
+            ], md=4),
+            dbc.Col([
+                html.Label("最少卧室数 / Min Bedrooms", className="fw-semibold"),
+                dcc.Dropdown(id="min-beds",
+                             options=[{"label": str(n), "value": n} for n in [1,2,3,4]],
+                             value=1, clearable=False, className="mb-0"),
+            ], md=4),
+        ], className="g-3"),
+    ]), md=7),
+], className="g-3 mb-4")
 
 # ── Metric card helper ─────────────────────────────────────────────────────────
 def metric_card(card_id, label):
     return dbc.Card([
         dbc.CardBody([
-            html.P(label, className="text-muted small mb-1"),
-            html.H4(id=card_id, className="mb-0 fw-bold"),
+            html.P(label, className="text-uppercase small mb-2", style={"letterSpacing": "0.06em", "color": "#64748b"}),
+            html.H4(id=card_id, className="mb-0 fw-bold", style={"color": "#0f172a"}),
         ])
-    ], className="shadow-sm text-center")
+    ], className="text-center", style={
+        "border": SOFT_BORDER,
+        "borderRadius": "18px",
+        "boxShadow": SHADOW,
+        "backgroundColor": PANEL_BG,
+    })
 
 
 def assumption_badge():
@@ -388,25 +468,30 @@ def assumption_badge():
 
 # ── Layout ─────────────────────────────────────────────────────────────────────
 app.layout = dbc.Container([
-    # Header
     dbc.Row([
-        dbc.Col([
-            html.H2("🏠 Atlanta 可承接房贷现金流分析", className="mb-0"),
-            html.H5("Atlanta Assumable Mortgage — Cash Flow Dashboard",
-                    className="text-muted mb-0"),
-            html.Small("数据来源 Withroam.com · 租金估算来自 Zillow / "
-                       "Data from Withroam.com · Rent estimates from Zillow",
-                       className="text-secondary"),
-        ])
-    ], className="py-3 border-bottom mb-3"),
+        dbc.Col(
+            html.Div([
+                html.Div([
+                    html.Span("Atlanta Market", className="badge rounded-pill me-2", style={"backgroundColor": "rgba(255,255,255,0.18)", "color": "#fff", "padding": "8px 12px"}),
+                    html.Span("Assumable Loans", className="badge rounded-pill", style={"backgroundColor": "rgba(255,255,255,0.12)", "color": "#e2e8f0", "padding": "8px 12px"}),
+                ], className="mb-3"),
+                html.H2("Assumable Mortgage Dashboard", className="mb-2", style={"color": "#fff", "fontWeight": "800"}),
+                html.Div("Atlanta 可承接房贷筛选、现金流分析与 Zillow 历史整合视图", className="mb-2", style={"color": "#dbeafe", "fontSize": "1.05rem"}),
+                html.Small("Withroam + RealtyAPI + internal underwriting assumptions", style={"color": "#bfdbfe"}),
+            ], style={
+                "background": HEADER_GRADIENT,
+                "borderRadius": "24px",
+                "padding": "28px 30px",
+                "boxShadow": "0 18px 45px rgba(15, 23, 42, 0.18)",
+            }),
+            width=12,
+        )
+    ], className="mb-4"),
+
+    top_controls,
 
     dbc.Row([
-        # Sidebar
-        dbc.Col(sidebar, width=3),
-
-        # Main content
         dbc.Col([
-            # Summary cards
             dbc.Row([
                 dbc.Col(metric_card("card-total",    "总房源 / Total Listings"),    width=2),
                 dbc.Col(metric_card("card-pos",      "正现金流 / Positive CF"),     width=2),
@@ -415,7 +500,6 @@ app.layout = dbc.Container([
                 dbc.Col(metric_card("card-avg-coc",  "现金回报率 / Avg CoC%"),      width=2),
             ], className="mb-3 g-2"),
 
-            # Table
             html.H5(id="table-title", className="mt-2 mb-1"),
             dash_table.DataTable(
                 id="main-table",
@@ -423,49 +507,51 @@ app.layout = dbc.Container([
                 filter_action="native",
                 page_action="native",
                 page_size=20,
-                style_table={"overflowX": "auto"},
+                style_table={"overflowX": "auto", "borderRadius": "18px", "border": SOFT_BORDER, "boxShadow": SHADOW, "backgroundColor": PANEL_BG},
                 style_header={
-                    "backgroundColor": "#2c3e50",
-                    "color": "white",
+                    "backgroundColor": "#e2e8f0",
+                    "color": "#0f172a",
                     "fontWeight": "bold",
                     "fontSize": "12px",
                     "whiteSpace": "normal",
                     "height": "auto",
+                    "border": "none",
+                    "padding": "12px 10px",
                 },
                 style_cell={
                     "fontSize": "12px",
-                    "padding": "6px 10px",
+                    "padding": "10px 12px",
                     "whiteSpace": "nowrap",
                     "overflow": "hidden",
                     "textOverflow": "ellipsis",
                     "maxWidth": "200px",
+                    "border": "none",
+                    "backgroundColor": "#ffffff",
                 },
                 style_data_conditional=[
                     {"if": {"row_index": "odd"},
-                     "backgroundColor": "#f8f9fa"},
+                     "backgroundColor": "#f8fafc"},
                 ],
                 tooltip_delay=0,
                 tooltip_duration=None,
             ),
 
-            # Property detail
             html.Hr(),
             html.H5("房源详情 / Property Detail", className="mb-2"),
             html.Div(id="property-detail"),
 
-            # Download
             html.Hr(),
             dbc.Button("下载筛选结果 CSV / Download CSV",
                        id="download-btn", color="primary", outline=True, size="sm"),
             dcc.Download(id="download"),
-        ], width=9),
+        ], width=12),
     ]),
-], fluid=True)
+], fluid=True, style={"backgroundColor": PAGE_BG, "minHeight": "100vh", "padding": "20px 18px 32px"})
 
 
 # ── Shared filter logic ────────────────────────────────────────────────────────
 def apply_filters(vacancy, maintenance, capex, use_pm, max_equity, min_cf,
-                  loan_types, min_beds):
+                  loan_types, property_types, min_beds):
     if RAW_DF.empty:
         return pd.DataFrame(), {}
 
@@ -483,6 +569,8 @@ def apply_filters(vacancy, maintenance, capex, use_pm, max_equity, min_cf,
         df = df[df["monthly_cashflow"].fillna(-9999) >= (-9999 if min_cf is None else min_cf)]
     if "loan_type" in df.columns and loan_types:
         df = df[df["loan_type"].str.upper().isin(loan_types) | df["loan_type"].isna()]
+    if "property_type" in df.columns and property_types:
+        df = df[df["property_type"].isin(property_types) | df["property_type"].isna()]
     if "beds" in df.columns and min_beds:
         df = df[df["beds"].fillna(0) >= min_beds]
 
@@ -509,11 +597,12 @@ def apply_filters(vacancy, maintenance, capex, use_pm, max_equity, min_cf,
     Input("max-equity",    "value"),
     Input("min-cf",        "value"),
     Input("loan-types",    "value"),
+    Input("property-types","value"),
     Input("min-beds",      "value"),
 )
-def update_table(vacancy, maintenance, capex, use_pm, max_equity, min_cf, loan_types, min_beds):
+def update_table(vacancy, maintenance, capex, use_pm, max_equity, min_cf, loan_types, property_types, min_beds):
     df, stats = apply_filters(vacancy, maintenance, capex, use_pm,
-                              max_equity, min_cf, loan_types, min_beds)
+                              max_equity, min_cf, loan_types, property_types, min_beds)
 
     # Cards
     total   = len(RAW_DF)
@@ -584,11 +673,12 @@ def update_table(vacancy, maintenance, capex, use_pm, max_equity, min_cf, loan_t
     State("max-equity", "value"),
     State("min-cf",     "value"),
     State("loan-types", "value"),
+    State("property-types","value"),
     State("min-beds",   "value"),
     State("current-rate","value"),
 )
 def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
-                  max_equity, min_cf, loan_types, min_beds, current_rate):
+                  max_equity, min_cf, loan_types, property_types, min_beds, current_rate):
     if not active_cell or not table_data:
         return html.P("点击表格中的任意行查看详情 / Click any row in the table to see details.",
                       className="text-muted")
@@ -599,7 +689,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
 
     # Re-derive full row from filtered df (display df has formatted strings)
     df, _ = apply_filters(vacancy, maintenance, capex, use_pm,
-                          max_equity, min_cf, loan_types, min_beds)
+                          max_equity, min_cf, loan_types, property_types, min_beds)
     if df.empty or row_idx >= len(df):
         return ""
 
@@ -612,6 +702,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
         return f"{v:.2f}%" if pd.notna(v) else "—"
 
     neighborhood = row.get("PropertyAddress_neighborhood")
+    property_type = row.get("property_type")
     zillow_url = row.get("PropertyZillowURL") or row.get("zillow_url")
     zestimate = row.get("zestimate")
     year_built = row.get("yearBuilt")
@@ -627,9 +718,11 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
         else row.get("DataPoints_Current_Rent_Zestimate")
     )
 
-    info_col = dbc.Col([
+    info_col = dbc.Col(dbc.Card(dbc.CardBody([
         html.H6("房产信息 / Property Info", className="text-primary fw-bold"),
         html.P([html.B("地址 / Address: "), str(row.get("address", "—"))]),
+        *([html.P([html.B("房产类型 / Property Type: "), str(property_type)])]
+          if pd.notna(property_type) and property_type else []),
         *([html.P([html.B("社区 / Neighborhood: "), str(neighborhood)])]
           if pd.notna(neighborhood) and neighborhood else []),
         html.P([html.B("邮编 / Zip: "), str(row.get("zip", "—"))]),
@@ -657,9 +750,9 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
                 className="mt-1",
             ) if zillow_url else "",
         ]),
-    ], width=4)
+    ]), style={"border": SOFT_BORDER, "borderRadius": "18px", "boxShadow": SHADOW, "backgroundColor": PANEL_BG}), width=4)
 
-    mortgage_col = dbc.Col([
+    mortgage_col = dbc.Col(dbc.Card(dbc.CardBody([
         html.H6("贷款详情 / Mortgage Details", className="text-primary fw-bold"),
         html.P([html.B("贷款类型 / Loan Type: "), str(row.get("loan_type", "—"))]),
         html.P([html.B("可承接利率 / Assumable Rate: "), fmt_pct(row.get("assumable_rate_pct"))]),
@@ -684,7 +777,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
                 assumption_badge() if remaining_years_source == "estimated_from_balance_payment_rate" else ""])
         if (pd.notna(row.get("monthly_rate_savings")) and
                 (row.get("monthly_rate_savings") or 0) > 0) else "",
-    ], width=4)
+    ]), style={"border": SOFT_BORDER, "borderRadius": "18px", "boxShadow": SHADOW, "backgroundColor": PANEL_BG}), width=4)
 
     cf = row.get("monthly_cashflow", 0) or 0
     cf_color = "success" if cf > 0 else "danger"
@@ -696,7 +789,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
         ("HOA管理费 / HOA",      row.get("monthly_hoa", 0) or 0),
     ]
 
-    cashflow_col = dbc.Col([
+    cashflow_col = dbc.Col(dbc.Card(dbc.CardBody([
         html.H6("现金流明细 / Cash Flow Breakdown", className="text-primary fw-bold"),
         html.P([html.B("预估租金 / Gross Rent: "),
                 f"${row.get('gross_rent',0):,.0f}/月(mo)"]),
@@ -735,7 +828,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
                 fmt_dollar(row.get("breakeven_rent")) + "/月(mo)",
                 assumption_badge()]),
         html.P([html.B("租金来源 / Rent Source: "), str(row.get("rent_source","—"))]),
-    ], width=4)
+    ]), style={"border": SOFT_BORDER, "borderRadius": "18px", "boxShadow": SHADOW, "backgroundColor": PANEL_BG}), width=4)
 
     history_df = get_property_history(row)
     history_empty = (
@@ -760,7 +853,7 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
                 dbc.Col(dcc.Graph(figure=sale_fig, config={"displayModeBar": False}), width=6),
             ], className="g-2"),
         ])
-    ], className="shadow-sm mt-3")
+    ], className="mt-3", style={"border": SOFT_BORDER, "borderRadius": "18px", "boxShadow": SHADOW, "backgroundColor": PANEL_BG})
 
     return html.Div([
         dbc.Row([info_col, mortgage_col, cashflow_col]),
@@ -779,13 +872,14 @@ def update_detail(active_cell, table_data, vacancy, maintenance, capex, use_pm,
     State("max-equity", "value"),
     State("min-cf",     "value"),
     State("loan-types", "value"),
+    State("property-types","value"),
     State("min-beds",   "value"),
     prevent_initial_call=True,
 )
 def download_csv(__, vacancy, maintenance, capex, use_pm,
-                 max_equity, min_cf, loan_types, min_beds):
+                 max_equity, min_cf, loan_types, property_types, min_beds):
     df, _ = apply_filters(vacancy, maintenance, capex, use_pm,
-                          max_equity, min_cf, loan_types, min_beds)
+                          max_equity, min_cf, loan_types, property_types, min_beds)
     return dcc.send_data_frame(df.to_csv, "atlanta_listings.csv", index=False)
 
 

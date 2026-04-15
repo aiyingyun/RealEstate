@@ -27,7 +27,7 @@ from project_paths import (
 
 
 API_URL = "https://zillow.realtyapi.io/byaddress"
-DEFAULT_REALTYAPI_KEY = "rt_3Ckx49mg9usP0RGZFfSn8k8r"
+DEFAULT_REALTYAPI_KEY = "demo"  # Replace with your actual key or set REALTYAPI_KEY env variable
 
 
 def flatten_json(value: Any, prefix: str = "") -> dict[str, Any]:

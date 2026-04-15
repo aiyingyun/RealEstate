@@ -33,7 +33,7 @@ from project_paths import (
 
 API_URL = "https://zillow.realtyapi.io/graph_charts"
 DEFAULT_WHICH = ("rent_zestimate_history", "zestimate_history")
-DEFAULT_REALTYAPI_KEY = "rt_3Ckx49mg9usP0RGZFfSn8k8r"
+DEFAULT_REALTYAPI_KEY = "demo_key_1234567890abcdef"  # replace with your actual key or set REALTYAPI_KEY
 
 
 def flatten_json(value: Any, prefix: str = "") -> dict[str, Any]:

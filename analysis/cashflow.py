@@ -15,6 +15,19 @@ def _safe_round(val, ndigits=0):
     return round(val, ndigits)
 
 
+def _num(value, default=0.0):
+    """Coerce nullable/NaN values to a usable float."""
+    if value is None:
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(num):
+        return default
+    return num
+
+
 def _estimate_remaining_years(principal: float, monthly_payment: float, annual_rate_pct: float) -> float | None:
     """Estimate remaining amortization term from balance, payment, and rate."""
     if principal <= 0 or monthly_payment <= 0 or annual_rate_pct < 0:
@@ -63,15 +76,15 @@ def calculate_cashflow(row: dict, assumptions: dict = None) -> dict:
     """
     cfg = {**DEFAULTS, **(assumptions or {})}
 
-    price = float(row.get("price") or 0)
-    loan_balance = float(row.get("loan_balance") or 0)
-    monthly_payment = float(row.get("monthly_payment") or 0)
-    monthly_tax = float(row.get("monthly_tax") or 0)
-    monthly_insurance = float(row.get("monthly_insurance") or 0)
-    monthly_loan_insurance = float(row.get("monthly_loan_insurance") or 0)
-    monthly_hoa = float(row.get("monthly_hoa") or 0)
-    rent_estimate = float(row.get("rent_estimate") or 0)
-    equity_needed = float(row.get("equity_needed") or (price - loan_balance) if price and loan_balance else 0)
+    price = _num(row.get("price"))
+    loan_balance = _num(row.get("loan_balance"))
+    monthly_payment = _num(row.get("monthly_payment"))
+    monthly_tax = _num(row.get("monthly_tax"))
+    monthly_insurance = _num(row.get("monthly_insurance"))
+    monthly_loan_insurance = _num(row.get("monthly_loan_insurance"))
+    monthly_hoa = _num(row.get("monthly_hoa"))
+    rent_estimate = _num(row.get("rent_estimate"))
+    equity_needed = _num(row.get("equity_needed"), default=(price - loan_balance) if price and loan_balance else 0)
 
     # --- Income ---
     gross_rent = rent_estimate
@@ -130,13 +143,13 @@ def calculate_cashflow(row: dict, assumptions: dict = None) -> dict:
         estimated_remaining_years = _estimate_remaining_years(
             principal=loan_balance,
             monthly_payment=monthly_payment,
-            annual_rate_pct=float(row.get("assumable_rate_pct") or 0),
+            annual_rate_pct=_num(row.get("assumable_rate_pct")),
         )
 
     effective_remaining_years = actual_remaining_years or estimated_remaining_years
 
     # Rate comparison: new mortgage rate savings
-    assumable_rate = float(row.get("assumable_rate_pct") or 0)
+    assumable_rate = _num(row.get("assumable_rate_pct"))
     new_rate = 7.0  # current 30yr fixed approximation
     if assumable_rate > 0 and loan_balance > 0 and effective_remaining_years:
         new_payment = _mortgage_payment(loan_balance, new_rate / 100 / 12, int(round(effective_remaining_years * 12)))
@@ -210,6 +223,18 @@ def summary_stats(df: pd.DataFrame) -> dict:
         return {}
 
     valid = df[df[cf_col].notna()]
+    if valid.empty:
+        return {
+            "total_listings": len(df),
+            "cashflow_positive": 0,
+            "cashflow_negative": 0,
+            "avg_monthly_cashflow": None,
+            "median_monthly_cashflow": None,
+            "best_cashflow": None,
+            "worst_cashflow": None,
+            "avg_equity_needed": None,
+            "avg_coc_return": None,
+        }
     pos = valid[valid[cf_col] > 0]
     neg = valid[valid[cf_col] <= 0]
 
